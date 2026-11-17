@@ -548,6 +548,95 @@ def count_objects(rgb, force_feature=None, keep_border=False):
     return best
 
 
+
+# ---------------------------------------------------------------- manual mode (all parameters set by the user)
+MANUAL_FEATURES = ["밝기", "배경과의 색 차이", "채도", "질감"]
+
+
+def manual_count(rgb, p):
+    """Same HW05 steps, every parameter given explicitly in p (sidebar sliders)."""
+    if rgb.ndim == 2:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+    rgb_s, scale = resize_long(rgb)
+    H0, W0 = rgb_s.shape[:2]
+    y0, y1 = int(H0 * p["roi_y"][0] / 100), max(int(H0 * p["roi_y"][1] / 100), int(H0 * p["roi_y"][0] / 100) + 10)
+    x0, x1 = int(W0 * p["roi_x"][0] / 100), max(int(W0 * p["roi_x"][1] / 100), int(W0 * p["roi_x"][0] / 100) + 10)
+    rgb_s = np.ascontiguousarray(rgb_s[y0:y1, x0:x1])
+    f = cv2.cvtColor(rgb_s, cv2.COLOR_RGB2GRAY)                               # 1. grayscale
+    total = f.size
+
+    # 2. noise reduction
+    mk = odd(p["median"])
+    f_den = cv2.medianBlur(f, mk) if mk > 1 else f.copy()
+    rgb_den = cv2.medianBlur(rgb_s, mk) if mk > 1 else rgb_s.copy()
+    if p["bilateral"]:
+        f_den = cv2.bilateralFilter(f_den, 7, 25, 7)
+        rgb_den = cv2.bilateralFilter(rgb_den, 7, 25, 7)
+
+    # feature image
+    lab = cv2.cvtColor(rgb_den, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[..., 0] *= 100 / 255.0
+    if p["feature"] == "배경과의 색 차이":
+        feat = to_u8(background_color_distance(lab))
+    elif p["feature"] == "채도":
+        feat = to_u8(np.hypot(lab[..., 1] - 128, lab[..., 2] - 128))
+    elif p["feature"] == "질감":
+        fl = f.astype(np.float32)
+        kt = odd(max(7, 0.02 * max(f.shape)))
+        mu = cv2.blur(fl, (kt, kt))
+        feat = to_u8(cv2.GaussianBlur(np.sqrt(np.maximum(cv2.blur(fl * fl, (kt, kt)) - mu * mu, 0)), (0, 0), kt / 3))
+    else:
+        feat = f_den
+    polarity = "bright" if p["bright"] else "dark"
+
+    # illumination correction (optional) and 3. thresholding
+    corr, T_otsu, _ = mask_from_feature(feat, polarity, p["correct"], total)
+    T = T_otsu if p["use_otsu"] else float(p["T"])
+    mask = (corr > T).astype(np.uint8)
+    if p["open"] > 1:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ellipse(p["open"]))
+    if p["close"] > 1:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ellipse(p["close"]))
+    if p["fill"]:
+        mask = ndimage.binary_fill_holes(mask).astype(np.uint8)
+
+    # 4. connected components (+ optional watershed split)
+    dist = ndimage.distance_transform_edt(mask).astype(np.float32)
+    markers = np.zeros(mask.shape, np.int32)
+    if p["split"]:
+        r_in = max(2.0, inscribed_radius(dist))
+        dist_s = cv2.GaussianBlur(dist, (0, 0), max(1.0, 0.2 * r_in))
+        markers, _ = ndimage.label(h_maxima(dist_s, max(0.5, p["split_h"] * r_in)))
+        lab_m, _ = components(mask)
+        missing = np.setdiff1d(np.unique(lab_m[mask > 0]), np.unique(lab_m[markers > 0]))
+        nxt = markers.max() + 1
+        for l in missing:
+            ys, xs = np.nonzero(lab_m == l)
+            i = np.argmax(dist_s[ys, xs])
+            markers[ys[i], xs[i]] = nxt
+            nxt += 1
+        labels = watershed(-dist_s, markers, mask=mask.astype(bool))
+        dist = dist_s
+    else:
+        labels, _ = ndimage.label(mask)
+
+    n = labels.max()
+    ids = np.arange(1, n + 1)
+    areas = np.bincount(labels.ravel(), minlength=n + 1)[1:]
+    ok = areas >= p["min_area"] * scale * scale            # min area given in original-image pixels
+    if not p["keep_border"]:
+        edge_ids = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        ok &= ~np.isin(ids, edge_ids)
+    labels = relabel(labels, ids[ok])
+    areas = np.bincount(labels.ravel())[1:] if labels.max() else np.array([], int)
+    cc = np.stack([np.arange(1, len(areas) + 1), areas], 1) if len(areas) else np.zeros((0, 2), int)
+    name = f"{p['feature']} ({'밝은' if p['bright'] else '어두운'} object)"
+    return dict(f=f, f_den=f_den, rgb=rgb_s, scale=scale, feature_name=name,
+                variant="직접 조정", feature=feat, corr=corr, T=T, mask=mask, dist=dist, markers=markers,
+                labels=labels, cc=cc, r=float(np.sqrt(np.median(areas) / np.pi)) if len(areas) else 0.0,
+                scores={"직접 조정": "자동 선택 사용 안 함"}, feature_names=MANUAL_FEATURES)
+
+
 # =====================================================================
 # Streamlit web page
 # =====================================================================
@@ -572,16 +661,25 @@ FEATURES = ["자동", "밝기 (밝은 object)", "밝기 (어두운 object)", "�
             "색 경계 분할 (전경 + 그래프 분할)"]
 
 
+def load_rgb(image_bytes):
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+    return np.array(img)
+
+
 @st.cache_data(show_spinner=False)
 def analyze(image_bytes, feature, keep_border):
-    img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
-    rgb = np.array(img)
+    rgb = load_rgb(image_bytes)
     res = count_objects(rgb, None if feature == "자동" else feature, keep_border)
     return rgb.shape, res
 
 
+@st.cache_data(show_spinner=False)
+def analyze_manual(image_bytes, params):
+    rgb = load_rgb(image_bytes)
+    return rgb.shape, manual_count(rgb, dict(params))
+
+
 st.write("## Homework 5 마정미 : Object Counting")
-st.write(":tomato:")
 st.caption("사진을 올리기만 하면 물체 밝기 방향, 물체 크기, 조명 보정, 임계값, 붙은 물체 분리를 "
            "영상에서 자동으로 정해서 object 개수를 셉니다.")
 
@@ -598,13 +696,59 @@ if my_upload is not None:
 elif os.path.exists(default_image):
     with open(default_image, "rb") as fp:
         data = fp.read()
-    st.info("기본 예시 사진(tomato_final.jpg)의 결과입니다. 왼쪽 사이드바에서 직접 찍은 사진을 올려 보세요.")
+    st.caption("기본 예시 사진(tomato_final.jpg)의 결과입니다. 왼쪽 사이드바에서 직접 찍은 사진을 올려 보세요.")
 else:
-    st.info("왼쪽 사이드바에서 직접 찍은 사진을 올려주세요.")
+    st.write("왼쪽 사이드바에서 직접 찍은 사진을 올려주세요.")
     st.stop()
 
 with st.spinner("분석 중..."):
-    orig_shape, r = analyze(data, feature, keep_border)
+    orig_shape, r_auto = analyze(data, feature, keep_border)
+
+# ---------------- manual fine-tuning (defaults = what the automatic mode chose) ----------------
+auto_feat = r_auto["feature_name"]
+def_feat = next((i for i, k in enumerate(MANUAL_FEATURES) if auto_feat.startswith(k[:2])), 0)
+def_bright = not auto_feat.endswith("어두운 object)")
+r_px = r_auto["r"] / max(r_auto["scale"], 1e-6)              # typical radius in original pixels
+pstr = lambda v: int(np.clip(odd(v), 1, 61))       # odd kernel sizes
+
+st.sidebar.write("---")
+st.sidebar.write("### 🛠 세부 조정")
+manual = st.sidebar.toggle("직접 조정 사용", False,
+                           help="켜면 아래 값으로만 처리합니다. 처음 값은 자동 모드가 고른 설정이에요.")
+if True:
+    st.sidebar.caption("1. 관심 영역 (ROI)")
+    roi_y = st.sidebar.slider("세로 범위 (%)", 0, 100, (0, 100), disabled=not manual)
+    roi_x = st.sidebar.slider("가로 범위 (%)", 0, 100, (0, 100), disabled=not manual)
+    st.sidebar.caption("2. Noise 제거")
+    med = st.sidebar.slider("Median filter 크기", 1, 15, 3, 2, disabled=not manual)
+    bil = st.sidebar.checkbox("Bilateral filter (경계 보존 smoothing)", True, disabled=not manual)
+    st.sidebar.caption("3. Thresholding")
+    feat_m = st.sidebar.selectbox("object를 구분할 영상", MANUAL_FEATURES, index=def_feat, disabled=not manual)
+    bright = st.sidebar.radio("object 밝기 (위 영상 기준)", ["밝음", "어두움"], index=0 if def_bright else 1,
+                              horizontal=True, disabled=not manual) == "밝음"
+    correct = st.sidebar.checkbox("조명 보정 (top-hat)", r_auto.get("variant") != "보정 없음", disabled=not manual)
+    use_otsu = st.sidebar.checkbox("Otsu 자동 임계값", True, disabled=not manual)
+    T_m = st.sidebar.slider("임계값 T (Otsu 끄면 사용)", 0, 255, int(r_auto["T"]), disabled=not (manual and not use_otsu))
+    op = st.sidebar.slider("Opening 커널 (작은 점 제거)", 1, 61, pstr(0.25 * r_auto["r"]), 2, disabled=not manual)
+    cl = st.sidebar.slider("Closing 커널 (틈 메우기)", 1, 61, pstr(0.12 * r_auto["r"]), 2, disabled=not manual)
+    fill = st.sidebar.checkbox("구멍 메우기 (hole filling)", True, disabled=not manual)
+    st.sidebar.caption("4. Connected component")
+    split = st.sidebar.checkbox("붙은 object 분리 (watershed)", True, disabled=not manual)
+    split_h = st.sidebar.slider("분리 민감도 (작을수록 많이 나눔)", 0.05, 1.0, 0.3, 0.05, disabled=not (manual and split))
+    min_a = st.sidebar.number_input("최소 면적 (원본 pixel)", 0, 10_000_000, int(max(20, 0.2 * np.pi * r_px * r_px)),
+                                    step=50, disabled=not manual)
+    kb = st.sidebar.checkbox("테두리에 잘린 object도 세기", keep_border, disabled=not manual)
+
+if manual:
+    params = (("roi_y", roi_y), ("roi_x", roi_x), ("median", med), ("bilateral", bil), ("feature", feat_m),
+              ("bright", bright), ("correct", correct), ("use_otsu", use_otsu), ("T", T_m), ("open", op),
+              ("close", cl), ("fill", fill), ("split", split), ("split_h", split_h), ("min_area", min_a),
+              ("keep_border", kb))
+    with st.spinner("직접 조정한 값으로 처리 중..."):
+        orig_shape, r = analyze_manual(data, params)
+    st.caption("직접 조정 모드: 사이드바의 세부 조정 값으로 처리한 결과입니다.")
+else:
+    r = r_auto
 rgb = r["rgb"]
 
 f, labels, cc = r["f"], r["labels"], r["cc"]
@@ -685,7 +829,7 @@ if n:
         st.dataframe({"번호": np.arange(1, n + 1), "pixels (원본 기준)": areas_orig},
                      hide_index=True, width="stretch")
 else:
-    st.warning("object를 찾지 못했습니다. 물체와 배경의 밝기 차이가 큰 사진으로 다시 시도해 보세요.")
+    st.write("object를 찾지 못했습니다. 물체와 배경의 밝기 차이가 큰 사진으로 다시 시도해 보세요.")
 
 with st.expander("자동 처리 방법"):
     st.markdown(
